@@ -13,9 +13,6 @@ static CGFloat kMaxWidgetHeight = 150;
 static NSSet<NSString *> *kWidgetBundleIdentifiers = nil;
 
 static BOOL gIsWidgetRenderer = NO;
-// iOS 17 起每个小组件通常由独立的 WidgetRenderer 进程渲染。
-// 区分「专用渲染进程」与 Default/CarPlay 共用渲染进程，用于窗口标记丢失时兜底。
-static BOOL gIsDedicatedWidgetRenderer = NO;
 
 static void ReloadPrefs() {
     static NSUserDefaults *prefs = nil;
@@ -375,29 +372,22 @@ static void ReloadPrefs() {
 
 - (void)display {
     UIView *view = (UIView *)self.delegate;
-    BOOL isTargetLayer = [view isKindOfClass:[UIView class]] &&
-                         view.window.rwb_shouldHideBackground.boolValue;
 
-    // snapshot 刷新/离屏渲染时 view.window 可能暂时为 nil，窗口标记会丢失，
-    // 该次渲染就会漏裁背景（表现为背景闪现约一秒，下次刷新才消失）。
-    // 专用 WidgetRenderer 进程一次只服务一个小组件，用进程身份兜底。
-    if (!isTargetLayer && gIsDedicatedWidgetRenderer && [view isKindOfClass:[UIView class]]) {
-        isTargetLayer = YES;
-    }
-
-    if (!isTargetLayer) {
+    // 判定必须严格限定在「已经打上标记的 widget 窗口」内：
+    // 若按进程身份兜底，会把 widget 自身内容的大矩形也裁掉，导致内容完全不显示。
+    if (![view isKindOfClass:[UIView class]] || !view.window.rwb_shouldHideBackground.boolValue) {
         %orig;
         return;
     }
 
     NSMutableDictionary *threadDict = [NSThread currentThread].threadDictionary;
 
-    // display 可能嵌套：内层结束时若清空计数器，外层后续大矩形的跳过序号
-    // 会被重置而错位，背景随之被绘制。用深度计数保证只有最外层才清理。
+    // display 可能嵌套：内层结束若清空计数器，会使外层后续大矩形的跳过序号
+    // 错位。用深度计数保证只有最外层才初始化/清理线程状态。
     NSInteger depth = [threadDict[@"rwb_displayDepth"] integerValue];
     threadDict[@"rwb_displayDepth"] = @(depth + 1);
     if (depth == 0) {
-        threadDict[@"rwb_didSkipFirstN"] = @(0);
+        threadDict[@"rwb_didSkipFirstN"] = nil;
         threadDict[@"rwb_didSkipFirst"] = nil;
     }
 
@@ -409,15 +399,12 @@ static void ReloadPrefs() {
 
     %orig;
 
-    threadDict[@"rwb_shouldHideBackground"] = nil;
     NSInteger newDepth = [threadDict[@"rwb_displayDepth"] integerValue];
     if (newDepth <= 1) {
         threadDict[@"rwb_displayDepth"] = nil;
-        if (@available(iOS 17, *)) {
-            threadDict[@"rwb_didSkipFirstN"] = nil;
-        } else {
-            threadDict[@"rwb_didSkipFirst"] = nil;
-        }
+        threadDict[@"rwb_shouldHideBackground"] = nil;
+        threadDict[@"rwb_didSkipFirstN"] = nil;
+        threadDict[@"rwb_didSkipFirst"] = nil;
     } else {
         threadDict[@"rwb_displayDepth"] = @(newDepth - 1);
     }
@@ -486,12 +473,17 @@ static void ReloadPrefs() {
     NSMutableDictionary *threadDict = [NSThread currentThread].threadDictionary;
     if (threadDict[@"rwb_shouldHideBackground"]) {
         if (arg1.size.width > kMaxWidgetWidth && arg1.size.height > kMaxWidgetHeight) {
-            // 原实现的裁剪条件为「序号 == 1 或 序号 > 1」，序号为 2 的大矩形被漏过。
-            // 一旦背景落在该矩形上就会闪现，直到下一次 snapshot 刷新才恢复。
-            // 改为从第 2 个起一律裁剪，与 iOS 16 的语义保持一致。
-            NSInteger index = [threadDict[@"rwb_didSkipFirstN"] integerValue];
-            threadDict[@"rwb_didSkipFirstN"] = @(index + 1);
-            if (index >= 1) {
+            // 使用上游经过验证的序号裁剪逻辑：保留第 1、3 个大矩形（可能是内容），
+            // 裁掉第 2、4+ 个（背景）。改为「第 2 个起全裁」会误伤内容导致 widget 消失。
+            NSNumber *firstN = threadDict[@"rwb_didSkipFirstN"];
+            if ([firstN intValue] > 1) {
+                %orig(CGRectZero);
+                return;
+            }
+            int newN = firstN ? [firstN intValue] + 1 : 0;
+            threadDict[@"rwb_didSkipFirstN"] = @(newN);
+            if (newN == 1) {
+                // Bypass the first background rect
                 %orig(CGRectZero);
                 return;
             }
@@ -507,9 +499,6 @@ static void ReloadPrefs() {
 %ctor {
     NSString *bundleIdentifier = [[NSBundle mainBundle] bundleIdentifier];
     gIsWidgetRenderer = [bundleIdentifier hasPrefix:@"com.apple.chrono.WidgetRenderer-"];
-    gIsDedicatedWidgetRenderer = gIsWidgetRenderer &&
-        ![bundleIdentifier isEqualToString:@"com.apple.chrono.WidgetRenderer-Default"] &&
-        ![bundleIdentifier isEqualToString:@"com.apple.chrono.WidgetRenderer-CarPlay"];
 
     ReloadPrefs();
     if (!kIsEnabled) {
